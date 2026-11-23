@@ -1,0 +1,62 @@
+--- a/main.js
++++ b/main.js
+@@ -3,7 +3,7 @@
+ // Markdown formatted, in a mod pane. Original: upstream/files-0.1.15/main.js.
+ import { View, div, svg } from "gpui-kit";
+ import { v_flex, h_flex, Editor, EditorState, TextView } from "gpui-base";
+-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, appHome, props } from "herdr";
++import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, appHome, props, run } from "herdr";
+ import * as fs from "fs/promises";
+ import { isMarkdown, frontMatterAsCode, chooseView, pickLocation, classifyLink, resolvePath, relativeTo } from "./lib.js";
+ import { createCache } from "./cache.js";
+@@ -12,7 +12,7 @@
+ // Drawn diagrams and copied images, relative to the app's home (image() reads only there).
+ const CACHE = "data/files-md";
+ 
+-const key = (where) => JSON.stringify({ cwd: where.cwd, on: where.on, space: where.space });
++const key = (where) => JSON.stringify({ cwd: where.cwd, on: where.on, space: where.space, preview: where.preview });
+ const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
+ const PER_FOLDER = 500, TOTAL = 5000;
+ 
+@@ -45,7 +45,11 @@
+   init(_props, cx) {
+     this.saved = new Map(); this.last = null; this.mode = "formatted"; this.history = [];
+     // pane.split {mod: "files-md", props: {file}}: a file to open first, inside the folder (SPEC R0).
+-    const file = props()?.file;
++    const spec = props();
++    this.preview = typeof spec?.previewRoot === "string" && typeof spec?.previewFile === "string" ? {
++      root: spec.previewRoot, file: spec.previewFile, tab: spec.previewTab, docked: spec.previewDocked === true
++    } : null;
++    const file = spec?.file;
+     this.opening = typeof file === "string" ? file : null;
+     // TextView selects text, but Herdr binds no copy key inside it. On 0.1.15 the text view answers
+     // input::Copy; from 0.1.16 it answers shell_root::Copy, so render() passes an unhandled one on.
+@@ -70,6 +74,9 @@
+   location() {
+     const where = pickLocation(spaces(), panes(), focused(), this.last);
+     if (where.terminal) this.last = where;
++    if (this.preview && (!this.preview.tab || focused().tab === this.preview.tab)) {
++      return { ...where, cwd: this.preview.root, on: null, preview: true };
++    }
+     return where;
+   }
+ 
+@@ -95,6 +102,7 @@
+       this.pending = new Set(); this.marks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
+       this.loading = false;
+       if (saved?.file) this.show(saved.file, cx);
++      else if (where.preview) this.show(this.preview.file, cx);
+       else if (this.opening && cwd) {
+         const r = resolvePath(this.opening, `${cwd}/.`, cwd), rel = r.path && relativeTo(r.path, cwd);
+         this.opening = null;
+@@ -288,7 +296,9 @@
+         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => this.back(cx)).child("←")))
+         .child(div().font_semibold().child("Files"))
+         .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? ""))
+-        .when(isMarkdown(this.file) && this.text !== null, el => el.child(this.modeSwitch(t))))
++        .when(isMarkdown(this.file) && this.text !== null, el => el.child(this.modeSwitch(t)))
++        .when(Boolean(this.preview?.docked), el => el.child(div().id("files-preview-close").px(6).cursor_pointer()
++          .text_color(t.muted).on_click(() => run("layout.hide", { id: "panel" })).child("×"))))
+       .when(Boolean(this.file && (this.message || this.notice)), el => el.child(div().flex_none().px(14).py(6).border_b(1).border_color(t.border).text_size(12).text_color(t.dim).child(this.message || this.notice)))
+       .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
+         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))

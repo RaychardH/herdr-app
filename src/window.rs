@@ -1499,6 +1499,15 @@ impl AppWindow {
             let (block, addr) = (id.clone(), address.clone());
             let sub = cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| match ev {
                 TerminalEvent::Peek(address) => this.peek_terminal(address, window, cx),
+                TerminalEvent::PreviewMarkdown(path) => match this.preview_markdown(&addr, path) {
+                    Ok(()) => this.sync(window, cx),
+                    Err(body) => {
+                        let spec = json!({"kind":"toast", "notification":{
+                            "title":"Markdown preview", "body":body, "level":"error"
+                        }});
+                        this.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                    }
+                },
                 TerminalEvent::TitleChanged => this.publish(cx),
                 TerminalEvent::ScrollChanged => {
                     mods::panes_scrolled();
@@ -2621,6 +2630,71 @@ impl AppWindow {
         let (addr, _) = self.spawn(argv, cwd, follow, &space, &ctx, on.as_deref(), size, window)?;
         self.model.split(&target, axis, &new, &addr);
         Ok(json!({ "pane": new, "terminal": addr }))
+    }
+
+    fn preview_markdown(&mut self, address: &str, path: &std::path::Path) -> Result<(), String> {
+        if address.contains('/') {
+            return Err("Open remote Markdown from the Files panel of its machine.".into());
+        }
+        if !path.is_file() {
+            return Err("The Markdown file is no longer available.".into());
+        }
+        if !self.folders.contains_key("files-md") {
+            return Err("Install the files-md preview mod in Herdr.".into());
+        }
+        let folder = path.parent().ok_or("The Markdown file has no parent folder.")?;
+        let root = self.cwds.get(address).map(std::path::Path::new)
+            .filter(|cwd| path.starts_with(cwd)).unwrap_or(folder);
+        let file = path.strip_prefix(root).map_err(|e| e.to_string())?;
+        let (Some(root), Some(file)) = (root.to_str(), file.to_str()) else {
+            return Err("The Markdown path cannot be displayed.".into());
+        };
+        let tab = self.model.pane_of(address).and_then(|pane| self.model.tab_of(&pane));
+        static PREVIEW_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = PREVIEW_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let props = json!({
+            "previewRoot": root, "previewFile": file, "previewSequence": sequence,
+            "previewTab": tab.map(|tab| tab.id.as_str())
+        });
+
+        if let Some(panel) = self.chrome.find_mut("panel")
+            && let Some(stack) = panel.find_mut("panel-body")
+        {
+            const SLOT: &str = "markdown-preview";
+            let mut docked_props = props.clone();
+            docked_props["previewDocked"] = json!(true);
+            let content = Content::Mod { name: "files-md".into(), props: docked_props };
+            if let Some(node) = stack.find_mut(SLOT) {
+                let Kind::Block { content: current } = &mut node.kind else {
+                    return Err("The Markdown preview slot is unavailable.".into());
+                };
+                *current = content;
+            } else {
+                stack.children_mut().ok_or("The right-side panel has no stack.")?
+                    .push(Node::block(SLOT, content));
+            }
+            if !panel.select("panel-body", SLOT) {
+                return Err("The Markdown preview could not be selected.".into());
+            }
+            panel.hidden = false;
+            return Ok(());
+        }
+
+        let pane = self.model.pane_of(address).ok_or("The source terminal has no pane.")?;
+        let tab = self.model.tab_of(&pane).ok_or("The source pane has no tab.")?;
+        let existing = tab.root.walk().into_iter().find(|node| {
+            matches!(node.content(), Some(Content::Mod { name, props }) if name == "files-md" && props.get("previewFile").is_some())
+        }).map(|node| node.id.clone());
+        if let Some(existing) = existing {
+            let tab_id = tab.id.clone();
+            let node = self.model.tab_mut(&tab_id).and_then(|tab| tab.root.find_mut(&existing));
+            if let Some(Node { kind: Kind::Block { content: Content::Mod { props: current, .. } }, .. }) = node {
+                *current = props;
+                return Ok(());
+            }
+        }
+        self.split_mod(Some(pane), Axis::Row, "files-md".into(), props)?;
+        Ok(())
     }
 
     /// A mod as a pane beside the target (a viewer next to the shell).
@@ -5947,6 +6021,56 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| super::AppWindow::with_file_events(crate::hc::offline(), requests, Some(crate::files::FileEvents::for_test(home.clone())), window, cx));
         assert_eq!(view.update(cx, |this, _| this.layout_name.clone()), "test");
         (view, cx)
+    }
+
+    #[gpui::test]
+    fn markdown_preview_reuses_the_files_panel(cx: &mut gpui::TestAppContext) {
+        const NAME: &str = "markdown_preview_reuses_the_files_panel";
+        if !running_alone(NAME) {
+            return in_own_process(NAME);
+        }
+        let home = crate::mods::app_dir();
+        let (view, cx) = open_window(cx, "files-md", r#"
+            import { View, div } from "gpui-kit";
+            import { props } from "herdr";
+            export default class TestFiles extends View {
+                render() { return div().child(props()?.previewFile ?? "Files"); }
+            }
+        "#, serde_json::json!({
+            "id":"root", "type":"row", "children":[{
+                "id":"panel", "type":"column", "hidden":true, "children":[{
+                    "id":"panel-body", "type":"stack", "active":"other", "children":[
+                        {"id":"files", "type":"block", "content":{"mod":"files-md"}},
+                        {"id":"other", "type":"block", "content":{"mod":"files-md"}}
+                    ]
+                }]
+            }]
+        }));
+        let first = home.join("first.md");
+        let second = home.join("第二份 #2.md");
+        std::fs::write(&first, "# First").unwrap();
+        std::fs::write(&second, "# Second").unwrap();
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            for path in [&first, &second] {
+                this.preview_markdown("t-test", path).unwrap();
+                this.sync(window, cx);
+                assert!(!this.chrome.find("panel").unwrap().hidden);
+                let files = this.chrome.find("markdown-preview").unwrap();
+                assert!(matches!(
+                    files.content(),
+                    Some(crate::layout::Content::Mod { name, props })
+                        if name == "files-md" && props["previewFile"].as_str() == path.file_name().and_then(|s| s.to_str())
+                ));
+                assert!(this.copies.contains_key("markdown-preview"));
+                assert!(this.chrome.find("files").is_some());
+            }
+            this.chrome.find_mut("panel").unwrap().hidden = true;
+            this.sync(window, cx);
+            assert!(this.chrome.find("panel").unwrap().hidden);
+            assert!(this.preview_markdown("remote/t-test", &first).is_err());
+            assert!(this.preview_markdown("t-test", &home.join("missing.md")).is_err());
+            assert!(this.chrome.find("panel").unwrap().hidden);
+        }));
     }
 
     /// A mod whose every version keeps `mib` MiB alive at module scope, in

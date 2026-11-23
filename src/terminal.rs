@@ -69,6 +69,7 @@ enum LinkTarget {
 
 pub enum TerminalEvent {
     Peek(String),
+    PreviewMarkdown(PathBuf),
     TitleChanged,
     SelectionChanged,
     /// History scroll position changed enough for mods that watch `panes().scroll`.
@@ -2495,6 +2496,9 @@ impl Render for TerminalView {
                     && let Some((target, _)) = this.link_at(ev.position)
                 {
                     match target {
+                        LinkTarget::External(links::Target::File(path)) if links::is_markdown_path(&path) => {
+                            cx.emit(TerminalEvent::PreviewMarkdown(path));
+                        }
                         LinkTarget::External(target) => links::open(&target),
                         LinkTarget::Terminal(address) => cx.emit(TerminalEvent::Peek(address)),
                     }
@@ -2789,6 +2793,49 @@ mod tests {
         }
         assert!(ended);
         assert!(rx.is_closed() && rx.is_empty());
+    }
+
+    #[gpui::test]
+    fn markdown_preview_click_routes_inside_the_app(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        let folder = crate::test_tmp().join(format!("herdr-click-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("report.MD");
+        std::fs::write(&path, "# Preview").unwrap();
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 5), cx)
+        });
+        cx.run_until_parked();
+        let observed = cx.new(|cx| {
+            cx.subscribe(&terminal, |file: &mut Option<std::path::PathBuf>, _, event: &super::TerminalEvent, _| {
+                if let super::TerminalEvent::PreviewMarkdown(path) = event {
+                    *file = Some(path.clone());
+                }
+            }).detach();
+            None
+        });
+        let at = terminal.update(cx, |terminal, cx| {
+            terminal.cwd = Some(folder.clone());
+            let mut grid = terminal.grid.borrow_mut();
+            grid.vt.write(b"./report.MD");
+            let at = point(grid.origin.x + grid.cell.width * 0.5, grid.origin.y + grid.cell.height * 0.5);
+            drop(grid);
+            cx.notify();
+            at
+        });
+        cx.run_until_parked();
+        assert!(terminal.read_with(cx, |terminal, _| terminal.link_at(at)).is_some());
+        let modifiers = Modifiers {
+            platform: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
+            ..Default::default()
+        };
+        cx.simulate_mouse_down(at, MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(at, MouseButton::Left, modifiers);
+        assert_eq!(observed.read_with(cx, |file, _| file.clone()), Some(path.clone()));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(folder).unwrap();
     }
 
     #[gpui::test]

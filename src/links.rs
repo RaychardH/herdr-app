@@ -80,7 +80,7 @@ pub fn resolve(link: &str, cwd: Option<&Path>) -> Option<Target> {
     });
     if scheme {
         // Windows can't open a file URL whose path is percent-encoded, the way programs write them.
-        if let Some(path) = file_url_path(link).filter(|p| p.exists()) {
+        if let Some(path) = file_url_path(link).filter(|p| p.exists() || is_markdown_path(p)) {
             return Some(Target::File(path));
         }
         return Some(Target::Url(link.to_owned()));
@@ -113,6 +113,12 @@ pub fn resolve(link: &str, cwd: Option<&Path>) -> Option<Target> {
         }
     }
     Path::new(bare).exists().then(|| Target::File(PathBuf::from(bare)))
+}
+
+pub fn is_markdown_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+        ["md", "markdown", "mdx"].iter().any(|kind| ext.eq_ignore_ascii_case(kind))
+    })
 }
 
 /// The path a `file:` URL names on this computer, percent-decoded.
@@ -405,6 +411,14 @@ mod tests {
             assert_eq!(resolve("src/main.rs.", Some(&dir)), Some(Target::File(dotted)));
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_markdown_file_urls_still_resolve_as_files() {
+        let url = "file:///missing-herdr-markdown-test/report.MD";
+        let path = super::file_url_path(url).unwrap();
+        assert!(!path.exists());
+        assert_eq!(resolve(url, None), Some(Target::File(path)));
     }
 
     #[test]
